@@ -1,0 +1,25 @@
+[package]
+name = "claude-recap"
+version = "0.1.0"
+edition = "2024"
+description = "Browse your Claude Code sessions by folder and see what you did in each"
+license = "MIT"
+repository = "https://github.com/GutoPin/claude-recap"
+readme = "README.md"
+keywords = ["claude", "cli", "tui", "sessions", "history"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "recap"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std", "serde"] }
+clap = { version = "4.6.9", features = ["derive"] }
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[profile.release]
+lto = true
+strip = true

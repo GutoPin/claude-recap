@@ -1,3 +1,4 @@
+mod config;
 mod parse;
 mod recap;
 mod skills;
@@ -25,6 +26,10 @@ struct Args {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Read colours from this file [default: ~/.config/claude-recap/config.json]
+    #[arg(long, global = true, value_name = "FILE")]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -38,6 +43,8 @@ enum Command {
     },
     /// Installed skills and how often each one was used
     Skills,
+    /// Where the config file goes and what it can hold
+    Config,
 }
 
 fn main() -> ExitCode {
@@ -51,13 +58,28 @@ fn main() -> ExitCode {
 }
 
 fn run(args: Args) -> Result<(), String> {
+    let config_path = args.config.or_else(config::path);
+    if matches!(args.command, Some(Command::Config)) {
+        let path = config_path.map_or("(no home directory)".into(), |p| p.display().to_string());
+        print!(
+            "Config file: {path}\n\nDefaults, as the file would be written:\n\n{}",
+            config::Config::default().json()
+        );
+        return Ok(());
+    }
+    let config = match &config_path {
+        Some(path) => config::load(path)?,
+        None => config::Config::default(),
+    };
     let root = store::config_dir(args.dir)?;
     let lib = store::load(&root)?;
     let now = Utc::now();
 
     match args.command {
         None if args.json => print_json(&lib),
-        None if std::io::stdout().is_terminal() => tui::run(&lib).map_err(|e| e.to_string()),
+        None if std::io::stdout().is_terminal() => {
+            tui::run(&lib, config.look(config::truecolor())).map_err(|e| e.to_string())
+        }
         None => {
             print!("{}", recap::folders_table(&lib, now));
             Ok(())
@@ -78,6 +100,7 @@ fn run(args: Args) -> Result<(), String> {
             print!("{}", recap::skills_table(&lib));
             Ok(())
         }
+        Some(Command::Config) => Ok(()),
     }
 }
 

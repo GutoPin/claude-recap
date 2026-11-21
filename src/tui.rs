@@ -8,15 +8,15 @@ use chrono::{DateTime, Local, TimeZone, Utc};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph};
+
+use crate::config::{Config, Look};
 
 use crate::recap::{Row, Tone, ago, day, folder_rows, money, session_rows, skill_rows, tilde};
 use crate::store::{Folder, Library};
 
-const ACCENT: Color = Color::Indexed(173);
-const GREY: Color = Color::Indexed(244);
 const WIDE: u16 = 90;
 const PAGE: u16 = 10;
 
@@ -29,6 +29,7 @@ enum View {
 
 pub struct App<'a> {
     lib: &'a Library,
+    look: Look,
     now: DateTime<Utc>,
     view: View,
     /// Where `esc` returns to from the skills list.
@@ -45,8 +46,9 @@ pub struct App<'a> {
     list: ListState,
 }
 
-pub fn run(lib: &Library) -> io::Result<()> {
+pub fn run(lib: &Library, look: Look) -> io::Result<()> {
     let mut app = App::new(lib, Utc::now());
+    app.look = look;
     let mut terminal = ratatui::init();
     let result = (|| {
         loop {
@@ -67,6 +69,7 @@ impl<'a> App<'a> {
     pub fn new(lib: &'a Library, now: DateTime<Utc>) -> Self {
         App {
             lib,
+            look: Config::default().look(true),
             now,
             view: View::Folders,
             before_skills: View::Folders,
@@ -221,35 +224,64 @@ impl<'a> App<'a> {
     where
         Tz::Offset: Display,
     {
-        let [header, body, footer] = Layout::vertical([
+        let look = self.look.clone();
+        let page = Style::new().fg(look.text).bg(look.background);
+        f.render_widget(Block::new().style(page), f.area());
+        let [_, header, _, body, _, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .areas(f.area());
-        let [left, right] = if body.width >= WIDE {
-            Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).areas(body)
+        let [_, body, _] = Layout::horizontal([
+            Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .areas(body);
+        let [left, _, right] = if body.width >= WIDE {
+            Layout::horizontal([
+                Constraint::Percentage(36),
+                Constraint::Length(2),
+                Constraint::Min(0),
+            ])
+            .areas(body)
         } else {
-            Layout::vertical([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(body)
+            Layout::vertical([
+                Constraint::Percentage(40),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .areas(body)
         };
 
         f.render_widget(Paragraph::new(self.breadcrumb()), header);
-        let (items, rows) = self.content(left.width.saturating_sub(4).into(), tz);
+        let (items, rows) = self.content(left.width.saturating_sub(3).into(), tz);
+        for panel in [left, right] {
+            shadow(f, panel, &look);
+        }
         self.draw_list(f, left, items);
         self.draw_recap(f, right, rows);
-        f.render_widget(
-            Paragraph::new(self.hint()).style(Style::new().fg(GREY)),
-            footer,
-        );
+        f.render_widget(Paragraph::new(self.hint()), footer);
     }
 
     fn breadcrumb(&self) -> Line<'static> {
-        let mut parts = vec![Span::styled(
-            " claude-recap",
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )];
+        let look = &self.look;
+        let mut parts = vec![
+            Span::raw("  "),
+            Span::styled(
+                " recap ",
+                Style::new()
+                    .fg(look.shadow)
+                    .bg(look.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
         let mut crumb = |text: String| {
-            parts.push(Span::styled("  ›  ", Style::new().fg(GREY)));
+            parts.push(Span::styled("  ›  ", Style::new().fg(look.faint)));
             parts.push(Span::raw(text));
         };
         match self.view {
@@ -265,25 +297,38 @@ impl<'a> App<'a> {
         Line::from(parts)
     }
 
-    fn hint(&self) -> String {
+    fn hint(&self) -> Line<'static> {
+        let look = &self.look;
+        let key = Style::new().fg(look.accent).add_modifier(Modifier::BOLD);
+        let label = Style::new().fg(look.muted);
+        let mut spans = vec![Span::raw("  ")];
+        let mut keys: Vec<(&str, &str)> = Vec::new();
         if self.typing {
-            return format!(" filter: {}_   enter keep   esc clear", self.filter);
-        }
-        let filter = if self.filter.is_empty() {
-            String::new()
+            spans.push(Span::styled("/ ", key));
+            spans.push(Span::raw(self.filter.clone()));
+            spans.push(Span::styled("█   ", Style::new().fg(look.accent)));
+            keys.extend([("enter", "keep"), ("esc", "clear")]);
         } else {
-            format!("filter: {}   ", self.filter)
-        };
-        let keys = match self.view {
-            View::Folders => {
-                "↑↓ move   enter open   / filter   s skills   pgup/pgdn scroll   q quit"
+            if !self.filter.is_empty() {
+                spans.push(Span::styled("filter ", label));
+                spans.push(Span::styled(format!("{}   ", self.filter), key));
             }
-            View::Sessions => {
-                "↑↓ move   esc back   / filter   s skills   pgup/pgdn scroll   q quit"
+            keys.push(("↑↓", "move"));
+            keys.push(match self.view {
+                View::Folders => ("enter", "open"),
+                _ => ("esc", "back"),
+            });
+            keys.push(("/", "filter"));
+            if self.view != View::Skills {
+                keys.push(("s", "skills"));
             }
-            View::Skills => "↑↓ move   esc back   / filter   pgup/pgdn scroll   q quit",
-        };
-        format!(" {filter}{keys}")
+            keys.extend([("pgup/pgdn", "scroll"), ("q", "quit")]);
+        }
+        for (name, what) in keys {
+            spans.push(Span::styled(name, key));
+            spans.push(Span::styled(format!(" {what}   "), label));
+        }
+        Line::from(spans)
     }
 
     /// The list entries of the current view and the recap of the selected one.
@@ -361,41 +406,51 @@ impl<'a> App<'a> {
         }
     }
 
+    fn panel(&self, title: &'static str) -> Block<'static> {
+        Block::new()
+            .style(Style::new().fg(self.look.text).bg(self.look.surface))
+            .title(Span::styled(title, Style::new().fg(self.look.muted)))
+    }
+
     fn draw_list(&mut self, f: &mut Frame, area: Rect, items: Vec<String>) {
         let title = match self.view {
-            View::Folders => " Folders ",
-            View::Sessions => " Sessions ",
-            View::Skills => " Skills ",
+            View::Folders => "  FOLDERS",
+            View::Sessions => "  SESSIONS",
+            View::Skills => "  SKILLS",
         };
         let selected = *self.cursor();
         self.list.select((!items.is_empty()).then_some(selected));
         let list = List::new(items.into_iter().map(ListItem::new))
-            .block(
-                Block::bordered()
-                    .title(title)
-                    .border_style(Style::new().fg(GREY)),
+            .block(self.panel(title).padding(Padding::new(0, 1, 1, 0)))
+            .highlight_style(
+                Style::new()
+                    .bg(self.look.raised)
+                    .add_modifier(Modifier::BOLD),
             )
-            .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
-            .highlight_symbol("› ");
+            .highlight_symbol(Line::from(Span::styled(
+                "▌ ",
+                Style::new().fg(self.look.accent),
+            )));
         f.render_stateful_widget(list, area, &mut self.list);
     }
 
     fn draw_recap(&mut self, f: &mut Frame, area: Rect, rows: Vec<Row>) {
-        let width = usize::from(area.width.saturating_sub(2));
+        let look = &self.look;
+        let width = usize::from(area.width.saturating_sub(4));
         let lines: Vec<Line> = if rows.is_empty() {
             let message = if self.filter.is_empty() {
                 "Nothing here yet."
             } else {
                 "Nothing matches the filter."
             };
-            vec![Line::styled(message, Style::new().fg(GREY))]
+            vec![Line::styled(message, Style::new().fg(look.muted))]
         } else {
             rows.into_iter()
                 .flat_map(|(tone, text)| {
                     let style = match tone {
-                        Tone::Title => Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        Tone::Title => Style::new().fg(look.accent).add_modifier(Modifier::BOLD),
                         Tone::Section => Style::new().add_modifier(Modifier::BOLD),
-                        Tone::Dim => Style::new().fg(GREY),
+                        Tone::Dim => Style::new().fg(look.muted),
                         Tone::Plain => Style::new(),
                     };
                     wrap(&text, width)
@@ -410,14 +465,27 @@ impl<'a> App<'a> {
             .scroll
             .min((lines.len() as u16).saturating_sub(inner_height.max(1)));
         let recap = Paragraph::new(lines)
-            .block(
-                Block::bordered()
-                    .title(" Recap ")
-                    .border_style(Style::new().fg(GREY)),
-            )
+            .block(self.panel("  RECAP").padding(Padding::new(2, 2, 1, 0)))
             .scroll((self.scroll, 0));
         f.render_widget(recap, area);
     }
+}
+
+/// A thin shadow along the right and bottom edges of `panel`, drawn in the
+/// cells just outside it.
+fn shadow(f: &mut Frame, panel: Rect, look: &Look) {
+    if !look.floats || panel.width < 2 || panel.height < 2 {
+        return;
+    }
+    let screen = f.area();
+    let side = Rect::new(panel.right(), panel.y + 1, 1, panel.height - 1).intersection(screen);
+    f.render_widget(Block::new().style(Style::new().bg(look.shadow)), side);
+    // Half a cell tall, which is about as thick as the side is wide.
+    let under = Rect::new(panel.x + 1, panel.bottom(), panel.width, 1).intersection(screen);
+    f.render_widget(
+        Paragraph::new("▀".repeat(under.width.into())).style(Style::new().fg(look.shadow)),
+        under,
+    );
 }
 
 /// Breaks `text` into lines of at most `width` characters, at spaces where it
@@ -428,6 +496,12 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     // Leading spaces are indentation and stay on the first line.
     let body = text.trim_start_matches(' ');
     let indent = (text.len() - body.len()).min(width - 1);
+    // A row like "10:00  some long text" continues under the text, not under
+    // the time. Narrow panes give that up to keep the room.
+    let hang = match body.find("  ") {
+        Some(at) if at <= 14 && indent + at + 2 < width / 2 => indent + at + 2,
+        _ => 0,
+    };
     let mut lines = Vec::new();
     let mut line = " ".repeat(indent);
     let mut len = indent;
@@ -435,8 +509,8 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     for word in body.split(' ') {
         let mut word: Vec<char> = word.chars().collect();
         if !fresh && len + 1 + word.len() > width {
-            lines.push(std::mem::take(&mut line));
-            len = 0;
+            lines.push(std::mem::replace(&mut line, " ".repeat(hang)));
+            len = hang;
             fresh = true;
         }
         if !fresh {
@@ -525,9 +599,9 @@ mod tests {
         assert_has(
             &text,
             &[
-                "claude-recap",
-                "Folders (2)",
-                "› shop",
+                "recap   ›  Folders (2)",
+                "FOLDERS",
+                "▌ shop",
                 "notes",
                 "2d ago",
                 "$4.00",
@@ -547,7 +621,7 @@ mod tests {
         assert_has(
             &screen(&mut app, 120, 30),
             &[
-                "› notes",
+                "▌ notes",
                 "/work/notes",
                 "1 session ·",
                 "summarize my notes",
@@ -560,7 +634,7 @@ mod tests {
             &text,
             &[
                 "/work/shop  ›  Sessions (2)",
-                "› why is the build failing?",
+                "▌ why is the build failing?",
                 "Cart and checkout",
                 "claude --resume bbbb-2222",
             ],
@@ -577,7 +651,7 @@ mod tests {
         );
 
         press(&mut app, "\x1b");
-        assert_has(&screen(&mut app, 120, 30), &["Folders (2)", "› shop"]);
+        assert_has(&screen(&mut app, 120, 30), &["Folders (2)", "▌ shop"]);
     }
 
     #[test]
@@ -592,7 +666,7 @@ mod tests {
             &text,
             &[
                 "Skills (5)",
-                "› frontend-design",
+                "▌ frontend-design",
                 "1x",
                 "tools:debugging",
                 "unused",
@@ -624,28 +698,49 @@ mod tests {
 
         press(&mut app, "/NOTE");
         let text = screen(&mut app, 120, 30);
-        assert_has(&text, &["Folders (1)", "› notes", "filter: NOTE_"]);
+        assert_has(&text, &["Folders (1)", "▌ notes", "/ NOTE█"]);
         assert!(!text.contains("shop"), "{text}");
 
         // While typing, letters are text, not commands.
         press(&mut app, "sq");
         assert_has(
             &screen(&mut app, 120, 30),
-            &[
-                "Folders (0)",
-                "Nothing matches the filter.",
-                "filter: NOTEsq_",
-            ],
+            &["Folders (0)", "Nothing matches the filter.", "/ NOTEsq█"],
         );
 
         press(&mut app, "\x1b\n/checkout\n");
         let text = screen(&mut app, 120, 30);
         assert_has(
             &text,
-            &["Sessions (1)", "› Cart and checkout", "filter: checkout   "],
+            &["Sessions (1)", "▌ Cart and checkout", "filter checkout   "],
         );
         press(&mut app, "\x1b");
         assert_has(&screen(&mut app, 120, 30), &["Sessions (2)"]);
+    }
+
+    #[test]
+    fn panels_are_surfaces_with_a_shadow() {
+        let fx = fixture();
+        let lib = load(&fx.0).unwrap();
+        let mut app = App::new(&lib, now());
+        let look = app.look.clone();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| app.draw(f, &Utc)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let count = |color| buffer.content().iter().filter(|c| c.bg == color).count();
+        assert_eq!(buffer[(0, 0)].bg, look.background);
+        assert!(count(look.surface) > 1000);
+        // The selected row is raised across the width of the list.
+        assert!(count(look.raised) > 30);
+        assert!(count(look.shadow) > 20);
+        assert!(!buffer.content().iter().any(|c| c.symbol() == "│"));
+
+        let mut flat = Config::default();
+        flat.theme.background = "terminal".into();
+        app.look = flat.look(true);
+        terminal.draw(|f| app.draw(f, &Utc)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(!buffer.content().iter().any(|c| c.symbol() == "▀"));
     }
 
     #[test]
@@ -655,7 +750,7 @@ mod tests {
         let mut app = App::new(&lib, now());
         assert_has(
             &screen(&mut app, 60, 24),
-            &["› shop", "/work/shop", "Sessions"],
+            &["▌ shop", "/work/shop", "Sessions"],
         );
         for (w, h) in [(10, 3), (1, 1), (40, 8)] {
             screen(&mut app, w, h);
@@ -721,6 +816,13 @@ mod tests {
         assert_eq!(
             wrap("10:00  add a cart page", 14),
             ["10:00  add a", "cart page"]
+        );
+        assert_eq!(
+            wrap("Nov 20 23:23  add a cart page with controls", 30),
+            [
+                "Nov 20 23:23  add a cart page",
+                "              with controls"
+            ]
         );
         assert_eq!(wrap("", 10), [""]);
         assert_eq!(wrap("añadir línea", 6), ["añadir", "línea"]);

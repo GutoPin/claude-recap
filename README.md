@@ -32,7 +32,7 @@ cargo install --path .
 
 Requires a recent stable Rust (it is built and tested with the current stable release).
 
-This installs a binary called `claude-recap`. If you installed an earlier version, which was called `recap`, remove it with `rm ~/.cargo/bin/recap`.
+This installs a binary called `claude-recap`. Earlier versions installed it as `recap`; installing this one with cargo removes the old binary.
 
 ## Update
 

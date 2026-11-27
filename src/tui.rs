@@ -14,6 +14,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph};
 
 use crate::config::{Config, Look};
 
+use crate::parse::Session;
 use crate::recap::{Row, Tone, ago, day, folder_rows, money, session_rows, skill_rows, tilde};
 use crate::store::{Folder, Library};
 
@@ -44,9 +45,12 @@ pub struct App<'a> {
     typing: bool,
     scroll: u16,
     list: ListState,
+    /// The session chosen with enter, to be resumed once the view closes.
+    resume: Option<&'a Session>,
 }
 
-pub fn run(lib: &Library, look: Look) -> io::Result<()> {
+/// Returns the session to resume, if one was chosen.
+pub fn run(lib: &Library, look: Look) -> io::Result<Option<&Session>> {
     let mut app = App::new(lib, Utc::now());
     app.look = look;
     let mut terminal = ratatui::init();
@@ -57,7 +61,7 @@ pub fn run(lib: &Library, look: Look) -> io::Result<()> {
                 && key.kind == KeyEventKind::Press
                 && app.on_key(key)
             {
-                return Ok(());
+                return Ok(app.resume);
             }
         }
     })();
@@ -81,6 +85,7 @@ impl<'a> App<'a> {
             typing: false,
             scroll: 0,
             list: ListState::default(),
+            resume: None,
         }
     }
 
@@ -205,6 +210,14 @@ impl<'a> App<'a> {
                     self.show(View::Sessions);
                 }
             }
+            KeyCode::Enter if self.view == View::Sessions => {
+                if let (Some(folder), Some(&i)) =
+                    (self.open_folder(), self.sessions().get(self.session))
+                {
+                    self.resume = Some(&folder.sessions[i]);
+                    return true;
+                }
+            }
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
                 self.go(0);
@@ -258,7 +271,12 @@ impl<'a> App<'a> {
             .areas(body)
         };
 
-        f.render_widget(Paragraph::new(self.breadcrumb()), header);
+        let crumb = self.breadcrumb();
+        let totals = self.totals();
+        if crumb.width() + totals.width() + 4 <= header.width as usize {
+            f.render_widget(Paragraph::new(totals).right_aligned(), header);
+        }
+        f.render_widget(Paragraph::new(crumb), header);
         let (items, rows) = self.content(left.width.saturating_sub(3).into(), tz);
         for panel in [left, right] {
             shadow(f, panel, &look);
@@ -273,7 +291,7 @@ impl<'a> App<'a> {
         let mut parts = vec![
             Span::raw("  "),
             Span::styled(
-                " recap ",
+                " claude recap ",
                 Style::new()
                     .fg(look.shadow)
                     .bg(look.accent)
@@ -297,6 +315,17 @@ impl<'a> App<'a> {
         Line::from(parts)
     }
 
+    fn totals(&self) -> Line<'static> {
+        let folders = &self.lib.folders;
+        let sessions: usize = folders.iter().map(|f| f.sessions.len()).sum();
+        let mut text = format!("{sessions} sessions");
+        let costs: Vec<f64> = folders.iter().filter_map(Folder::cost_usd).collect();
+        if !costs.is_empty() {
+            text += &format!(" · {}", money(costs.iter().sum()));
+        }
+        Line::styled(text + "  ", Style::new().fg(self.look.faint))
+    }
+
     fn hint(&self) -> Line<'static> {
         let look = &self.look;
         let key = Style::new().fg(look.accent).add_modifier(Modifier::BOLD);
@@ -314,10 +343,11 @@ impl<'a> App<'a> {
                 spans.push(Span::styled(format!("{}   ", self.filter), key));
             }
             keys.push(("↑↓", "move"));
-            keys.push(match self.view {
-                View::Folders => ("enter", "open"),
-                _ => ("esc", "back"),
-            });
+            match self.view {
+                View::Folders => keys.push(("enter", "open")),
+                View::Sessions => keys.extend([("enter", "resume"), ("esc", "back")]),
+                View::Skills => keys.push(("esc", "back")),
+            }
             keys.push(("/", "filter"));
             if self.view != View::Skills {
                 keys.push(("s", "skills"));
@@ -599,7 +629,7 @@ mod tests {
         assert_has(
             &text,
             &[
-                "recap   ›  Folders (2)",
+                "claude recap   ›  Folders (2)",
                 "FOLDERS",
                 "▌ shop",
                 "notes",
@@ -652,6 +682,18 @@ mod tests {
 
         press(&mut app, "\x1b");
         assert_has(&screen(&mut app, 120, 30), &["Folders (2)", "▌ shop"]);
+    }
+
+    #[test]
+    fn enter_on_a_session_picks_it_to_resume() {
+        let fx = fixture();
+        let lib = load(&fx.0).unwrap();
+        let mut app = App::new(&lib, now());
+        press(&mut app, "\n/cart\n");
+        let text = screen(&mut app, 120, 30);
+        assert_has(&text, &["enter resume", "esc back", "3 sessions · $4.00"]);
+        assert!(app.on_key(KeyEvent::from(KeyCode::Enter)));
+        assert_eq!(app.resume.unwrap().id, "aaaa-1111");
     }
 
     #[test]

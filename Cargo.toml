@@ -10,7 +10,7 @@ keywords = ["claude", "cli", "tui", "sessions", "history"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
-name = "recap"
+name = "claude-recap"
 path = "src/main.rs"
 
 [dependencies]

@@ -115,9 +115,9 @@ impl<'a> App<'a> {
     }
 
     fn skills(&self) -> Vec<usize> {
-        (0..self.lib.skills.len())
+        (0..self.lib.skills().len())
             .filter(|&i| {
-                let s = &self.lib.skills[i];
+                let s = &self.lib.skills()[i];
                 self.matches(&[&s.name, &s.description, &s.source.label()])
             })
             .collect()
@@ -388,7 +388,7 @@ impl<'a> App<'a> {
                 let items = shown
                     .iter()
                     .map(|&i| {
-                        let skill = &self.lib.skills[i];
+                        let skill = &self.lib.skills()[i];
                         let uses = if skill.uses == 0 {
                             String::new()
                         } else {
@@ -399,7 +399,7 @@ impl<'a> App<'a> {
                     .collect();
                 let rows = shown
                     .get(self.skill)
-                    .map(|&i| skill_rows(&self.lib.skills[i], self.now))
+                    .map(|&i| skill_rows(&self.lib.skills()[i], self.now))
                     .unwrap_or_default();
                 (items, rows)
             }
@@ -782,7 +782,7 @@ mod tests {
         let lib = Library {
             root: "/nowhere".into(),
             folders: Vec::new(),
-            skills: Vec::new(),
+            skills: Vec::new().into(),
         };
         let mut app = App::new(&lib, now());
         assert_has(
@@ -798,7 +798,7 @@ mod tests {
         let lib = Library {
             root: "/nowhere".into(),
             folders: Vec::new(),
-            skills: Vec::new(),
+            skills: Vec::new().into(),
         };
         let mut app = App::new(&lib, now());
         assert!(app.on_key(KeyEvent::from(KeyCode::Char('q'))));

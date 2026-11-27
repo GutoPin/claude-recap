@@ -353,11 +353,11 @@ pub fn folders_table(lib: &Library, now: DateTime<Utc>) -> String {
 }
 
 pub fn skills_table(lib: &Library) -> String {
-    if lib.skills.is_empty() {
+    if lib.skills().is_empty() {
         return "No skills installed or used\n".to_string();
     }
     let width = lib
-        .skills
+        .skills()
         .iter()
         .map(|s| s.name.chars().count())
         .max()
@@ -367,7 +367,7 @@ pub fn skills_table(lib: &Library) -> String {
         "{:>4}  {:<width$}  {:<24}  DESCRIPTION\n",
         "USES", "SKILL", "SOURCE"
     );
-    for skill in &lib.skills {
+    for skill in lib.skills() {
         let line = format!(
             "{:>4}  {:<width$}  {:<24}  {}",
             skill.uses,
@@ -459,12 +459,12 @@ mod tests {
     fn skill_recap() {
         let fx = fixture();
         let lib = load(&fx.0).unwrap();
-        let text = to_text(&skill_rows(&lib.skills[0], now()));
+        let text = to_text(&skill_rows(&lib.skills()[0], now()));
         assert!(text.starts_with(
             "frontend-design\nuser · used 1 time · last used 3d ago\n\nGuidance for distinctive visual design.\n\nUsed in\n   1  shop\n"
         ));
         assert!(text.trim_end().ends_with("skills/frontend-design/SKILL.md"));
-        let unused = to_text(&skill_rows(&lib.skills[4], now()));
+        let unused = to_text(&skill_rows(&lib.skills()[4], now()));
         assert!(unused.contains("user · never used\n"), "{unused}");
     }
 

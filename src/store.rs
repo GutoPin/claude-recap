@@ -2,6 +2,8 @@
 //! grouped by the folder it was started in.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -50,7 +52,21 @@ pub struct Library {
     pub root: PathBuf,
     /// Most recently active first.
     pub folders: Vec<Folder>,
-    pub skills: Vec<Skill>,
+    /// Filled on first use: finding skills can take seconds when a project
+    /// sits on a slow mount, and the folder list should not wait for it.
+    #[serde(serialize_with = "skills_of")]
+    pub skills: OnceLock<Vec<Skill>>,
+}
+
+fn skills_of<S: serde::Serializer>(cell: &OnceLock<Vec<Skill>>, s: S) -> Result<S::Ok, S::Error> {
+    cell.get().map_or(&[][..], Vec::as_slice).serialize(s)
+}
+
+impl Library {
+    pub fn skills(&self) -> &[Skill] {
+        self.skills
+            .get_or_init(|| skills::discover(&self.root, &self.folders))
+    }
 }
 
 pub fn home() -> Option<PathBuf> {
@@ -59,15 +75,18 @@ pub fn home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The directory Claude Code itself uses: `CLAUDE_CONFIG_DIR`, then `~/.claude`.
+pub fn default_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home().map(|h| h.join(".claude")))
+}
+
 /// `--dir`, then `CLAUDE_CONFIG_DIR`, then `~/.claude`.
 pub fn config_dir(flag: Option<PathBuf>) -> Result<PathBuf, String> {
     let dir = flag
-        .or_else(|| {
-            std::env::var_os("CLAUDE_CONFIG_DIR")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-        })
-        .or_else(|| home().map(|h| h.join(".claude")))
+        .or_else(default_dir)
         .ok_or("could not find a home directory, pass --dir")?;
     if !dir.join("projects").is_dir() {
         return Err(format!(
@@ -127,30 +146,44 @@ pub fn load(root: &Path) -> Result<Library, String> {
             .then_with(|| a.path.cmp(&b.path))
     });
 
-    let skills = skills::discover(root, &folders);
     Ok(Library {
         root: root.to_path_buf(),
         folders,
-        skills,
+        skills: OnceLock::new(),
     })
 }
 
 /// Parses transcripts on all cores, keeping the input order.
 fn parse_all(files: &[&PathBuf]) -> Vec<Option<Session>> {
+    par_map(files, |f| parse_session(f))
+}
+
+/// Runs `f` over `items` on all cores, keeping the input order. Work is
+/// handed out one item at a time, so one slow item does not hold up others.
+pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let next = AtomicUsize::new(0);
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let chunk = files.len().div_ceil(workers).max(1);
+    let mut out: Vec<Option<R>> = items.iter().map(|_| None).collect();
     std::thread::scope(|scope| {
-        let handles: Vec<_> = files
-            .chunks(chunk)
-            .map(|batch| {
-                scope.spawn(move || batch.iter().map(|f| parse_session(f)).collect::<Vec<_>>())
+        let handles: Vec<_> = (0..workers.min(items.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(i) else { break done };
+                        done.push((i, f(item)));
+                    }
+                })
             })
             .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect()
-    })
+        for h in handles {
+            for (i, r) in h.join().expect("worker panicked") {
+                out[i] = Some(r);
+            }
+        }
+    });
+    out.into_iter().flatten().collect()
 }
 
 #[cfg(test)]

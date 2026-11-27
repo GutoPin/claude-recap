@@ -76,9 +76,16 @@ fn run(args: Args) -> Result<(), String> {
     let now = Utc::now();
 
     match args.command {
-        None if args.json => print_json(&lib),
+        None if args.json => {
+            lib.skills();
+            print_json(&lib)
+        }
         None if std::io::stdout().is_terminal() => {
-            tui::run(&lib, config.look(config::truecolor())).map_err(|e| e.to_string())
+            // Leaked so skills can be found on a thread of their own while the
+            // list is already on screen; the process ends with the view anyway.
+            let lib: &'static Library = Box::leak(Box::new(lib));
+            std::thread::spawn(|| lib.skills());
+            tui::run(lib, config.look(config::truecolor())).map_err(|e| e.to_string())
         }
         None => {
             print!("{}", recap::folders_table(&lib, now));
@@ -95,7 +102,7 @@ fn run(args: Args) -> Result<(), String> {
             );
             Ok(())
         }
-        Some(Command::Skills) if args.json => print_json(&lib.skills),
+        Some(Command::Skills) if args.json => print_json(lib.skills()),
         Some(Command::Skills) => {
             print!("{}", recap::skills_table(&lib));
             Ok(())

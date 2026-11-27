@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::store::Folder;
+use crate::store::{Folder, par_map};
 
 const PLUGIN_SEARCH_DEPTH: usize = 4;
 
@@ -57,11 +57,40 @@ struct Install {
 
 /// Most used first, then by name.
 pub fn discover(root: &Path, folders: &[Folder]) -> Vec<Skill> {
+    // Collected first and read together, because project folders can sit on
+    // a slow mount (a Windows drive under WSL) where each file costs ~20 ms.
+    let mut wanted: Vec<(PathBuf, String, Source)> = Vec::new();
+    for file in skill_files(&root.join("skills"), 1) {
+        wanted.push((file, String::new(), Source::User));
+    }
+    let installed = std::fs::read_to_string(root.join("plugins/installed_plugins.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Installed>(&text).ok());
+    for (key, installs) in installed.map(|i| i.plugins).unwrap_or_default() {
+        let plugin = key.split('@').next().unwrap_or(&key).to_string();
+        for dir in installs.into_iter().filter_map(|i| i.install_path) {
+            for file in skill_files(&dir, PLUGIN_SEARCH_DEPTH) {
+                wanted.push((file, format!("{plugin}:"), Source::Plugin(plugin.clone())));
+            }
+        }
+    }
+    let project_files = par_map(folders, |folder| {
+        skill_files(&Path::new(&folder.path).join(".claude/skills"), 1)
+    });
+    for (folder, files) in folders.iter().zip(project_files) {
+        for file in files {
+            wanted.push((
+                file,
+                String::new(),
+                Source::Project(folder.name().to_string()),
+            ));
+        }
+    }
+    let texts = par_map(&wanted, |(file, _, _)| std::fs::read_to_string(file).ok());
+
     let mut found: BTreeMap<String, Skill> = BTreeMap::new();
-    let mut add = |file: PathBuf, prefix: &str, source: Source| {
-        let Ok(text) = std::fs::read_to_string(&file) else {
-            return;
-        };
+    for ((file, prefix, source), text) in wanted.into_iter().zip(texts) {
+        let Some(text) = text else { continue };
         let (name, description) = front_matter(&text);
         let name = name.unwrap_or_else(|| {
             file.parent()
@@ -79,26 +108,6 @@ pub fn discover(root: &Path, folders: &[Folder]) -> Vec<Skill> {
             last_used: None,
             used_in: BTreeMap::new(),
         });
-    };
-
-    for file in skill_files(&root.join("skills"), 1) {
-        add(file, "", Source::User);
-    }
-    let installed = std::fs::read_to_string(root.join("plugins/installed_plugins.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Installed>(&text).ok());
-    for (key, installs) in installed.map(|i| i.plugins).unwrap_or_default() {
-        let plugin = key.split('@').next().unwrap_or(&key).to_string();
-        for dir in installs.into_iter().filter_map(|i| i.install_path) {
-            for file in skill_files(&dir, PLUGIN_SEARCH_DEPTH) {
-                add(file, &format!("{plugin}:"), Source::Plugin(plugin.clone()));
-            }
-        }
-    }
-    for folder in folders {
-        for file in skill_files(&Path::new(&folder.path).join(".claude/skills"), 1) {
-            add(file, "", Source::Project(folder.name().to_string()));
-        }
     }
 
     for folder in folders {
@@ -200,7 +209,7 @@ mod tests {
         let fx = fixture();
         let lib = load(&fx.0).unwrap();
         let rows: Vec<_> = lib
-            .skills
+            .skills()
             .iter()
             .map(|s| (s.name.as_str(), s.source.label(), s.uses))
             .collect();
@@ -215,7 +224,7 @@ mod tests {
             ]
         );
 
-        let design = &lib.skills[0];
+        let design = &lib.skills()[0];
         assert_eq!(
             design.description,
             "Guidance for distinctive visual design."
@@ -232,9 +241,12 @@ mod tests {
                 .unwrap()
                 .ends_with("skills/frontend-design/SKILL.md")
         );
-        assert_eq!(lib.skills[2].description, "Find the root cause: first.");
-        assert_eq!(lib.skills[4].description, "Never invoked, spans two lines.");
-        assert!(lib.skills[1].file.is_none());
+        assert_eq!(lib.skills()[2].description, "Find the root cause: first.");
+        assert_eq!(
+            lib.skills()[4].description,
+            "Never invoked, spans two lines."
+        );
+        assert!(lib.skills()[1].file.is_none());
     }
 
     #[test]

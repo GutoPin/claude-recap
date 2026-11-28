@@ -16,7 +16,7 @@ use crate::config::{Config, Look};
 
 use crate::parse::Session;
 use crate::recap::{Row, Tone, ago, day, folder_rows, money, session_rows, skill_rows, tilde};
-use crate::store::{Folder, Library};
+use crate::store::{Folder, Library, Period, active_since};
 
 const WIDE: u16 = 90;
 const PAGE: u16 = 10;
@@ -30,12 +30,15 @@ enum View {
 
 pub struct App<'a> {
     lib: &'a Library,
+    period: Period,
+    /// The library's folders with only the sessions in `period`.
+    scoped: Vec<Folder>,
     look: Look,
     now: DateTime<Utc>,
     view: View,
     /// Where `esc` returns to from the skills list.
     before_skills: View,
-    /// Index into `lib.folders` of the folder whose sessions are open.
+    /// Index into `scoped` of the folder whose sessions are open.
     open: usize,
     /// Position in the filtered list of each view.
     folder: usize,
@@ -46,13 +49,14 @@ pub struct App<'a> {
     scroll: u16,
     list: ListState,
     /// The session chosen with enter, to be resumed once the view closes.
-    resume: Option<&'a Session>,
+    resume: Option<Session>,
 }
 
 /// Returns the session to resume, if one was chosen.
-pub fn run(lib: &Library, look: Look) -> io::Result<Option<&Session>> {
+pub fn run(lib: &Library, look: Look, period: Period) -> io::Result<Option<Session>> {
     let mut app = App::new(lib, Utc::now());
     app.look = look;
+    app.set_period(period);
     let mut terminal = ratatui::init();
     let result = (|| {
         loop {
@@ -73,6 +77,8 @@ impl<'a> App<'a> {
     pub fn new(lib: &'a Library, now: DateTime<Utc>) -> Self {
         App {
             lib,
+            period: Period::All,
+            scoped: active_since(&lib.folders, None),
             look: Config::default().look(true),
             now,
             view: View::Folders,
@@ -94,14 +100,45 @@ impl<'a> App<'a> {
         needle.is_empty() || haystack.iter().any(|h| h.to_lowercase().contains(&needle))
     }
 
+    /// A folder shows when its path matches the filter or one of its
+    /// sessions does, so the filter searches every prompt at once.
     fn folders(&self) -> Vec<usize> {
-        (0..self.lib.folders.len())
-            .filter(|&i| self.matches(&[&self.lib.folders[i].path]))
+        (0..self.scoped.len())
+            .filter(|&i| {
+                let folder = &self.scoped[i];
+                self.matches(&[&folder.path])
+                    || folder.sessions.iter().any(|s| self.session_matches(s))
+            })
             .collect()
     }
 
-    fn open_folder(&self) -> Option<&'a Folder> {
-        self.lib.folders.get(self.open)
+    fn session_matches(&self, s: &Session) -> bool {
+        let name = s.name();
+        let mut fields = vec![name.as_str()];
+        fields.extend(s.prompts.iter().map(|p| p.text.as_str()));
+        self.matches(&fields)
+    }
+
+    fn open_folder(&self) -> Option<&Folder> {
+        self.scoped.get(self.open)
+    }
+
+    fn set_period(&mut self, period: Period) {
+        let open = self.open_folder().map(|f| f.path.clone());
+        self.period = period;
+        self.scoped = active_since(&self.lib.folders, period.since(self.now, &Local));
+        if self.view == View::Sessions {
+            match self
+                .scoped
+                .iter()
+                .position(|f| Some(&f.path) == open.as_ref())
+            {
+                Some(i) => self.open = i,
+                None => self.show(View::Folders),
+            }
+        }
+        let at = *self.cursor();
+        self.go(at);
     }
 
     fn sessions(&self) -> Vec<usize> {
@@ -109,13 +146,7 @@ impl<'a> App<'a> {
             return Vec::new();
         };
         (0..folder.sessions.len())
-            .filter(|&i| {
-                let s = &folder.sessions[i];
-                let name = s.name();
-                let mut fields = vec![name.as_str()];
-                fields.extend(s.prompts.iter().map(|p| p.text.as_str()));
-                self.matches(&fields)
-            })
+            .filter(|&i| self.session_matches(&folder.sessions[i]))
             .collect()
     }
 
@@ -205,16 +236,23 @@ impl<'a> App<'a> {
             KeyCode::Char('/') => self.typing = true,
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if self.view == View::Folders => {
                 if let Some(&folder) = self.folders().get(self.folder) {
+                    // A folder that showed only because its sessions match keeps
+                    // the filter, so those sessions are what opens.
+                    let keep = !self.matches(&[&self.scoped[folder].path]);
+                    let filter = std::mem::take(&mut self.filter);
                     self.open = folder;
                     self.session = 0;
                     self.show(View::Sessions);
+                    if keep {
+                        self.filter = filter;
+                    }
                 }
             }
             KeyCode::Enter if self.view == View::Sessions => {
                 if let (Some(folder), Some(&i)) =
                     (self.open_folder(), self.sessions().get(self.session))
                 {
-                    self.resume = Some(&folder.sessions[i]);
+                    self.resume = Some(folder.sessions[i].clone());
                     return true;
                 }
             }
@@ -223,6 +261,7 @@ impl<'a> App<'a> {
                 self.go(0);
             }
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => self.back(),
+            KeyCode::Char('t') => self.set_period(self.period.next()),
             KeyCode::Char('s') if self.view == View::Skills => self.back(),
             KeyCode::Char('s') => {
                 self.before_skills = self.view;
@@ -312,11 +351,18 @@ impl<'a> App<'a> {
             }
             View::Skills => crumb(format!("Skills ({})", self.skills().len())),
         }
+        if self.period != Period::All && self.view != View::Skills {
+            parts.push(Span::styled("  ·  ", Style::new().fg(look.faint)));
+            parts.push(Span::styled(
+                self.period.label(),
+                Style::new().fg(look.accent),
+            ));
+        }
         Line::from(parts)
     }
 
     fn totals(&self) -> Line<'static> {
-        let folders = &self.lib.folders;
+        let folders = &self.scoped;
         let sessions: usize = folders.iter().map(|f| f.sessions.len()).sum();
         let mut text = format!("{sessions} sessions");
         let costs: Vec<f64> = folders.iter().filter_map(Folder::cost_usd).collect();
@@ -350,6 +396,9 @@ impl<'a> App<'a> {
             }
             keys.push(("/", "filter"));
             if self.view != View::Skills {
+                keys.push(("t", "period"));
+            }
+            if self.view != View::Skills {
                 keys.push(("s", "skills"));
             }
             keys.extend([("pgup/pgdn", "scroll"), ("q", "quit")]);
@@ -372,7 +421,7 @@ impl<'a> App<'a> {
                 let items = shown
                     .iter()
                     .map(|&i| {
-                        let folder = &self.lib.folders[i];
+                        let folder = &self.scoped[i];
                         let when = folder
                             .last_active()
                             .map(|at| ago(self.now, at))
@@ -387,7 +436,7 @@ impl<'a> App<'a> {
                     .collect();
                 let rows = shown
                     .get(self.folder)
-                    .map(|&i| folder_rows(&self.lib.folders[i], self.now, tz))
+                    .map(|&i| folder_rows(&self.scoped[i], self.now, tz))
                     .unwrap_or_default();
                 (items, rows)
             }
@@ -468,10 +517,15 @@ impl<'a> App<'a> {
         let look = &self.look;
         let width = usize::from(area.width.saturating_sub(4));
         let lines: Vec<Line> = if rows.is_empty() {
-            let message = if self.filter.is_empty() {
-                "Nothing here yet."
+            let message = if !self.filter.is_empty() {
+                "Nothing matches the filter.".to_string()
+            } else if self.period != Period::All && self.view != View::Skills {
+                format!(
+                    "No sessions {}. Press t for a longer period.",
+                    self.period.label()
+                )
             } else {
-                "Nothing matches the filter."
+                "Nothing here yet.".to_string()
             };
             vec![Line::styled(message, Style::new().fg(look.muted))]
         } else {
@@ -883,5 +937,64 @@ mod tests {
             "a-very… 2d ago"
         );
         assert_eq!(columns("x", "", 1), "x ");
+    }
+
+    #[test]
+    fn t_narrows_everything_to_a_period() {
+        let fx = fixture();
+        let lib = load(&fx.0).unwrap();
+        let mut app = App::new(&lib, now());
+
+        press(&mut app, "t");
+        assert_has(
+            &screen(&mut app, 120, 30),
+            &[
+                "Folders (0)",
+                "·  today",
+                "No sessions today. Press t for a longer period.",
+            ],
+        );
+        press(&mut app, "t");
+        let text = screen(&mut app, 120, 30);
+        assert_has(
+            &text,
+            &[
+                "Folders (1)",
+                "·  last 7 days",
+                "▌ shop",
+                "2 sessions · $",
+                "t period",
+            ],
+        );
+        assert!(!text.contains("notes"), "{text}");
+
+        // Back to all time, open notes, then pick a period it has no sessions in.
+        press(&mut app, "ttt");
+        press(&mut app, "j\n");
+        assert_has(
+            &screen(&mut app, 120, 30),
+            &["/work/notes  ›  Sessions (1)"],
+        );
+        press(&mut app, "t");
+        assert_has(&screen(&mut app, 120, 30), &["Folders (0)", "today"]);
+    }
+
+    #[test]
+    fn the_folder_filter_searches_every_prompt() {
+        let fx = fixture();
+        let lib = load(&fx.0).unwrap();
+        let mut app = App::new(&lib, now());
+
+        press(&mut app, "/checkout\n");
+        assert_has(&screen(&mut app, 120, 30), &["Folders (1)", "▌ shop"]);
+        press(&mut app, "\n");
+        assert_has(
+            &screen(&mut app, 120, 30),
+            &["Sessions (1)", "▌ Cart and checkout", "filter checkout"],
+        );
+
+        // When the path is what matched, every session of the folder opens.
+        press(&mut app, "\x1b\x1b/shop\n\n");
+        assert_has(&screen(&mut app, 120, 30), &["Sessions (2)"]);
     }
 }

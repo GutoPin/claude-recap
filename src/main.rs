@@ -13,7 +13,7 @@ use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 
 use parse::Session;
-use store::{Folder, Library};
+use store::{Folder, Library, Period, active_since};
 
 /// Browse your Claude Code sessions by folder and see what you did in each.
 #[derive(Parser)]
@@ -26,6 +26,14 @@ struct Args {
     /// Print JSON instead of text
     #[arg(long, global = true)]
     json: bool,
+
+    /// Only sessions active in this period; `t` changes it in the interface
+    #[arg(long, global = true, value_name = "PERIOD")]
+    since: Option<Period>,
+
+    /// Print the recap as Markdown, with `folder` and `summary`
+    #[arg(long, global = true)]
+    markdown: bool,
 
     /// Read colours from this file [default: ~/.config/claude-recap/config.json]
     #[arg(long, global = true, value_name = "FILE")]
@@ -42,6 +50,8 @@ enum Command {
         /// A path, or just the folder name
         path: Option<String>,
     },
+    /// What you did across all folders in a period [default: --since week]
+    Summary,
     /// Installed skills and how often each one was used
     Skills,
     /// Where the config file goes and what it can hold
@@ -80,36 +90,62 @@ fn run(args: Args) -> Result<(), String> {
     let root = store::config_dir(args.dir)?;
     let lib = store::load(&root)?;
     let now = Utc::now();
+    let period = args.since.unwrap_or_default();
+    let since = period.since(now, &Local);
+    let render = |rows: Vec<recap::Row>| {
+        let text = if args.markdown {
+            recap::to_markdown(&rows)
+        } else {
+            recap::to_text(&rows)
+        };
+        print!("{text}");
+        Ok(())
+    };
 
     match args.command {
         None if args.json => {
+            // Skills first: they are found from every folder, not only the ones in the period.
             lib.skills();
-            print_json(&lib)
+            print_json(&within(lib, since))
         }
         None if std::io::stdout().is_terminal() => {
             // Leaked so skills can be found on a thread of their own while the
             // list is already on screen; the process ends with the view anyway.
             let lib: &'static Library = Box::leak(Box::new(lib));
             std::thread::spawn(|| lib.skills());
-            match tui::run(lib, config.look(config::truecolor())).map_err(|e| e.to_string())? {
-                Some(session) => resume(session, &lib.root),
+            let look = config.look(config::truecolor());
+            match tui::run(lib, look, period).map_err(|e| e.to_string())? {
+                Some(session) => resume(&session, &lib.root),
                 None => Ok(()),
             }
         }
         None => {
-            print!("{}", recap::folders_table(&lib, now));
+            print!("{}", recap::folders_table(&within(lib, since), now));
             Ok(())
         }
         Some(Command::Folder { path }) => {
-            let folder = find_folder(&lib, path.as_deref())?;
+            let found = find_folder(&lib, path.as_deref())?;
+            let folder = active_since(std::slice::from_ref(found), since)
+                .pop()
+                .ok_or_else(|| {
+                    format!(
+                        "no sessions in {} {}",
+                        recap::tilde(&found.path),
+                        period.label()
+                    )
+                })?;
             if args.json {
-                return print_json(folder);
+                return print_json(&folder);
             }
-            print!(
-                "{}",
-                recap::to_text(&recap::folder_rows(folder, now, &Local))
-            );
-            Ok(())
+            render(recap::folder_rows(&folder, now, &Local))
+        }
+        Some(Command::Summary) => {
+            let period = args.since.unwrap_or(Period::Week);
+            let folders = active_since(&lib.folders, period.since(now, &Local));
+            if args.json {
+                return print_json(&folders);
+            }
+            render(recap::period_rows(&folders, period.label(), now, &Local))
         }
         Some(Command::Skills) if args.json => print_json(lib.skills()),
         Some(Command::Skills) => {
@@ -160,6 +196,12 @@ fn update() -> Result<(), String> {
         .success()
         .then_some(())
         .ok_or_else(|| "cargo install failed".to_string())
+}
+
+/// The library with only the sessions active since `since`.
+fn within(mut lib: Library, since: Option<chrono::DateTime<Utc>>) -> Library {
+    lib.folders = active_since(&lib.folders, since);
+    lib
 }
 
 fn print_json<T: serde::Serialize + ?Sized>(value: &T) -> Result<(), String> {

@@ -30,6 +30,23 @@ pub fn to_text(rows: &[Row]) -> String {
     rows.iter().map(|(_, text)| format!("{text}\n")).collect()
 }
 
+/// The same rows as Markdown: a heading per title and section, a list item
+/// per line, so a recap can go into notes or a report.
+pub fn to_markdown(rows: &[Row]) -> String {
+    rows.iter()
+        .map(|(tone, text)| {
+            let text = text.trim();
+            match tone {
+                _ if text.is_empty() => "\n".to_string(),
+                Tone::Title => format!("# {text}\n"),
+                Tone::Section => format!("## {text}\n"),
+                Tone::Dim => format!("*{text}*\n"),
+                Tone::Plain => format!("- {text}\n"),
+            }
+        })
+        .collect()
+}
+
 /// Replaces the home directory with `~`.
 pub fn tilde(path: &str) -> String {
     let Some(home) = home() else {
@@ -184,6 +201,62 @@ where
         ]);
     }
     let skills = merged(folder.sessions.iter().map(|s| &s.skills));
+    if !skills.is_empty() {
+        rows.extend([
+            blank(),
+            (Tone::Section, "Skills".to_string()),
+            (Tone::Plain, tally(&skills)),
+        ]);
+    }
+    rows
+}
+
+/// Everything done across folders in a period: totals, then each folder with
+/// its sessions. `folders` holds only the sessions in the period.
+pub fn period_rows<Tz: TimeZone>(
+    folders: &[Folder],
+    label: &str,
+    now: DateTime<Utc>,
+    tz: &Tz,
+) -> Vec<Row>
+where
+    Tz::Offset: Display,
+{
+    let mut rows = vec![(Tone::Title, format!("Claude Code, {label}"))];
+    let sessions: usize = folders.iter().map(|f| f.sessions.len()).sum();
+    if sessions == 0 {
+        rows.push((Tone::Dim, format!("No sessions {label}.")));
+        return rows;
+    }
+    let mut facts = vec![format!(
+        "{} in {}",
+        plural(sessions, "session", "sessions"),
+        plural(folders.len(), "folder", "folders")
+    )];
+    let costs: Vec<f64> = folders.iter().filter_map(Folder::cost_usd).collect();
+    if !costs.is_empty() {
+        facts.push(money(costs.iter().sum()));
+    }
+    let output: u64 = folders.iter().map(|f| f.tokens().output).sum();
+    facts.push(format!("{} output tokens", compact(output)));
+    rows.push((Tone::Dim, facts.join(" · ")));
+
+    for folder in folders {
+        let mut title = format!(
+            "{}  ·  {}",
+            tilde(&folder.path),
+            plural(folder.sessions.len(), "session", "sessions")
+        );
+        if let Some(cost) = folder.cost_usd() {
+            title += &format!(" · {}", money(cost));
+        }
+        rows.extend([blank(), (Tone::Section, title)]);
+        for session in &folder.sessions {
+            let when = session.ended.map(|at| day(at, now, tz)).unwrap_or_default();
+            rows.push((Tone::Plain, format!("{when:<8}{}", session.name())));
+        }
+    }
+    let skills = merged(folders.iter().flat_map(|f| &f.sessions).map(|s| &s.skills));
     if !skills.is_empty() {
         rows.extend([
             blank(),
@@ -506,5 +579,36 @@ mod tests {
         let last_year: DateTime<Utc> = "2025-12-31T23:00:00Z".parse().unwrap();
         assert_eq!(day(last_year, now(), &Utc), "Dec 31, 2025");
         assert_eq!(cut("abcdef", 4), "abc…");
+    }
+
+    #[test]
+    fn a_period_recap_and_its_markdown() {
+        let fx = fixture();
+        let lib = load(&fx.0).unwrap();
+        let week =
+            crate::store::active_since(&lib.folders, Some(now() - chrono::TimeDelta::days(7)));
+        let rows = period_rows(&week, "last 7 days", now(), &Utc);
+        let text = to_text(&rows);
+        for part in [
+            "Claude Code, last 7 days",
+            "2 sessions in 1 folder · $",
+            "/work/shop  ·  2 sessions",
+            "Cart and checkout",
+            "frontend-design",
+        ] {
+            assert!(text.contains(part), "missing {part:?} in:\n{text}");
+        }
+        assert!(!text.contains("notes"), "{text}");
+
+        let md = to_markdown(&rows);
+        assert!(
+            md.starts_with("# Claude Code, last 7 days\n*2 sessions in 1 folder"),
+            "{md}"
+        );
+        assert!(md.contains("\n## /work/shop  ·  2 sessions"), "{md}");
+        assert!(md.contains("\n- "), "{md}");
+
+        let none = to_text(&period_rows(&[], "today", now(), &Utc));
+        assert_eq!(none, "Claude Code, today\nNo sessions today.\n");
     }
 }

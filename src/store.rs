@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use serde::Serialize;
 
 use crate::parse::{Session, Tokens, parse_session};
@@ -18,6 +18,74 @@ pub struct Folder {
     pub path: String,
     /// Newest first.
     pub sessions: Vec<Session>,
+}
+
+/// A window of time to recap, counted back from now.
+#[derive(Debug, Clone, Copy, PartialEq, Default, clap::ValueEnum)]
+pub enum Period {
+    #[default]
+    All,
+    Today,
+    Week,
+    Month,
+    Year,
+}
+
+impl Period {
+    pub fn next(self) -> Period {
+        match self {
+            Period::All => Period::Today,
+            Period::Today => Period::Week,
+            Period::Week => Period::Month,
+            Period::Month => Period::Year,
+            Period::Year => Period::All,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Period::All => "all time",
+            Period::Today => "today",
+            Period::Week => "last 7 days",
+            Period::Month => "last 30 days",
+            Period::Year => "last 12 months",
+        }
+    }
+
+    /// When the period starts; `Today` starts at midnight in `tz`.
+    pub fn since<Tz: TimeZone>(self, now: DateTime<Utc>, tz: &Tz) -> Option<DateTime<Utc>> {
+        let days = match self {
+            Period::All => return None,
+            Period::Today => {
+                let midnight = now.with_timezone(tz).date_naive().and_hms_opt(0, 0, 0)?;
+                return tz
+                    .from_local_datetime(&midnight)
+                    .earliest()
+                    .map(|at| at.with_timezone(&Utc));
+            }
+            Period::Week => 7,
+            Period::Month => 30,
+            Period::Year => 365,
+        };
+        Some(now - TimeDelta::days(days))
+    }
+}
+
+/// The folders with sessions active since `since`, holding only those sessions.
+pub fn active_since(folders: &[Folder], since: Option<DateTime<Utc>>) -> Vec<Folder> {
+    folders
+        .iter()
+        .map(|f| Folder {
+            path: f.path.clone(),
+            sessions: f
+                .sessions
+                .iter()
+                .filter(|s| since.is_none_or(|t| s.ended.is_some_and(|e| e >= t)))
+                .cloned()
+                .collect(),
+        })
+        .filter(|f| !f.sessions.is_empty())
+        .collect()
 }
 
 impl Folder {
@@ -355,5 +423,28 @@ pub mod tests {
         assert_eq!(config_dir(Some(fx.0.clone())), Ok(fx.0.clone()));
         let err = config_dir(Some(fx.0.join("nope"))).unwrap_err();
         assert!(err.contains("no Claude Code sessions"), "{err}");
+    }
+
+    #[test]
+    fn periods_count_back_from_now() {
+        let now: DateTime<Utc> = "2026-03-05T09:00:10Z".parse().unwrap();
+        assert_eq!(Period::All.since(now, &Utc), None);
+        assert_eq!(
+            Period::Today.since(now, &Utc).unwrap().to_rfc3339(),
+            "2026-03-05T00:00:00+00:00"
+        );
+        assert_eq!(
+            Period::Week.since(now, &Utc).unwrap().to_rfc3339(),
+            "2026-02-26T09:00:10+00:00"
+        );
+        assert_eq!(Period::Year.next(), Period::All);
+
+        let fx = fixture();
+        let lib = load(&fx.0).unwrap();
+        let week = active_since(&lib.folders, Period::Week.since(now, &Utc));
+        assert_eq!(week.len(), 1);
+        assert_eq!(week[0].path, "/work/shop");
+        assert_eq!(week[0].sessions.len(), 2);
+        assert_eq!(active_since(&lib.folders, None).len(), 2);
     }
 }

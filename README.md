@@ -54,7 +54,8 @@ claude-recap
 | `↑` `↓` or `j` `k` | Move |
 | `enter` | Open a folder; on a session, resume it in Claude Code |
 | `esc` | Go back |
-| `/` | Filter the current list |
+| `/` | Filter the current list; on folders it also searches every prompt |
+| `t` | Period: all time, today, last 7 days, last 30 days, last 12 months |
 | `s` | Skills: what is installed and how often you use each one |
 | `pgup` `pgdn` | Scroll the recap |
 | `q` | Quit |
@@ -66,6 +67,12 @@ Opening a folder lists its sessions, and the recap shows every prompt you typed 
 <p align="center">
   <img src="assets/session.png" alt="A session recap with its prompts, edited files, tools and skills" width="860">
 </p>
+
+### Search and periods
+
+On the folder list, `/` searches folder paths and the prompts of every session. A folder that shows up only because of its prompts opens with the filter still on, so you land on the matching sessions.
+
+`t` steps through periods. Folders, sessions, recaps and the totals at the top then count only sessions active in that period. `--since today|week|month|year` starts the view on one.
 
 ### Skills
 
@@ -81,11 +88,13 @@ Press `s` from anywhere to list the skills you have installed, with how many tim
 claude-recap                    # piped: a table of folders
 claude-recap folder             # recap of the current directory
 claude-recap folder ~/code/shop # or of any folder, by path or by name
+claude-recap summary            # every folder and session from the last 7 days
+claude-recap summary --since month --markdown > month.md
 claude-recap skills             # installed skills and how often each was used
 claude-recap --json             # everything, for your own scripts
 ```
 
-`--json` works with every command.
+`--json` works with every command. `--since` narrows the table, `folder` and `summary` to one period, and `--markdown` prints `folder` and `summary` as Markdown for notes or a report.
 
 ```
 FOLDER              SESSIONS  LAST ACTIVE       COST
